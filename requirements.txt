@@ -1,0 +1,5 @@
+torch>=2.4        # nn.RMSNorm, SDPA
+numpy
+requests          # data/shakespeare_char/prepare.py
+matplotlib        # plots.py
+pytest            # tests/

@@ -1,0 +1,639 @@
+diff --git a/upstream_ref/model.py b/model.py
+index c698f8b..b9cc9b4 100644
+--- a/upstream_ref/model.py
++++ b/model.py
+@@ -5,6 +5,19 @@ References:
+ https://github.com/openai/gpt-2/blob/master/src/model.py
+ 2) huggingface/transformers PyTorch implementation:
+ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
++
++[hybrid-attn] Modified from karpathy/nanoGPT @ 3adf61e to support four attention variants:
++    attn='mha'      standard causal multi-head attention (upstream nanoGPT)
++    attn='swa'      MHA restricted to a sliding window of W tokens   (Mistral 7B, arXiv:2310.06825)
++    attn='mla'      Multi-head Latent Attention + decoupled RoPE      (DeepSeek-V2, arXiv:2405.04434, Sec. 2.1)
++    attn='mla_swa'  hybrid: MLA whose latent KV cache is a rolling buffer of W tokens
++plus RoPE positions (pos_emb='rope') and a KV cache for incremental decoding.
++With the defaults (attn='mha', pos_emb='learned') the model is identical to upstream nanoGPT.
++
++Window semantics: query i sees keys j with i-W < j <= i, i.e. exactly W keys including
++itself. (The Mistral text says "i-W .. i" = W+1 tokens; its figure shows W. We use W.)
++Shape legend: B batch, T tokens, H heads, hs head size, dc kv latent, dq query latent,
++dR decoupled-RoPE size, S cached tokens.
+ """
+ 
+ import math
+@@ -26,7 +39,122 @@ class LayerNorm(nn.Module):
+     def forward(self, input):
+         return F.layer_norm(input, self.weight.shape, self.weight, self.bias, 1e-5)
+ 
++# -----------------------------------------------------------------------------
++# [hybrid-attn] helpers: RoPE, sliding-window mask, KV cache
++
++def rope_cos_sin(pos, dim, base, dtype):
++    """pos: (T,) absolute positions -> cos, sin of shape (T, dim/2)."""
++    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, device=pos.device, dtype=torch.float32) / dim))
++    ang = pos.to(torch.float32)[:, None] * inv_freq[None, :]
++    return ang.cos().to(dtype), ang.sin().to(dtype)
++
++def apply_rope(x, cos, sin):
++    """Rotate consecutive pairs (x0,x1),(x2,x3),... of the last dim. x: (..., T, dim)."""
++    x1, x2 = x[..., 0::2], x[..., 1::2]
++    return torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1).flatten(-2)
++
++def sliding_window_mask(T, window, device):
++    """(T, T) bool, True = may attend: causal and within the last `window` positions."""
++    i = torch.arange(T, device=device)
++    return (i[None, :] <= i[:, None]) & (i[None, :] > i[:, None] - window)
++
++def block_window_attention(q, k, v, W, dropout_p=0.0):
++    """Sliding-window attention computing O(T * W) scores instead of O(T^2).
++
++    Split the queries into blocks of W. A query in block b only sees keys of blocks b-1 and b,
++    so every block attends to 2W keys, and all blocks but the first run as one batch.
++    Same result as the mask (tested); T > W is assumed.
++    """
++    B, H, _, E = q.size()
++    n, r = q.size(-2) // W, q.size(-2) % W                       # n full blocks, r tokens left over
++    a = torch.arange(W, device=q.device)[:, None]                # query offset inside its block
++    c = torch.arange(2 * W, device=q.device)[None, :]            # key offset inside blocks (b-1, b)
++    mask = (c > a) & (c <= a + W)                                # (W, 2W): causal and within W
++
++    def sdpa(q, k, v, **kw):
++        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, **kw)
++
++    def two_blocks(t):                                           # (B, H, nW, d) -> (B(n-1), H, 2W, d)
++        return t[..., :n * W, :].unfold(2, 2 * W, W).transpose(-1, -2).transpose(1, 2).flatten(0, 1)
++
++    out = [sdpa(q[..., :W, :], k[..., :W, :], v[..., :W, :], is_causal=True)]     # block 0: no previous block
++    if n > 1:
++        q_mid = q[..., W:n * W, :].view(B, H, n - 1, W, E).transpose(1, 2).flatten(0, 1)
++        y = sdpa(q_mid, two_blocks(k), two_blocks(v), attn_mask=mask)             # (B(n-1), H, W, Ev)
++        out.append(y.view(B, n - 1, H, W, -1).transpose(1, 2).flatten(2, 3))
++    if r:                                                                         # incomplete last block
++        s = (n - 1) * W
++        out.append(sdpa(q[..., n * W:, :], k[..., s:, :], v[..., s:, :], attn_mask=mask[:r, :W + r]))
++    return torch.cat(out, dim=-2)
++
++def causal_attention(q, k, v, window=None, dropout_p=0.0, impl='mask'):
++    """q, k: (B, H, T, E), v: (B, H, T, Ev); scale 1/sqrt(E) (= 1/sqrt(hs + dR) for MLA).
++
++    The window has two equivalent implementations (see REPORT.md, Section 2):
++    impl='mask':  naive; computes all T x T scores and loses the fused is_causal kernel.
++    impl='block': optimized; computes O(T * W) scores.
++    """
++    T = q.size(-2)
++    if window is None or window >= T:
++        return F.scaled_dot_product_attention(q, k, v, dropout_p=dropout_p, is_causal=True)
++    if impl == 'block':
++        return block_window_attention(q, k, v, window, dropout_p)
++    mask = sliding_window_mask(T, window, q.device)
++    return F.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=dropout_p)
++
++def explicit_attention_probs(q, k, window=None):
++    """[hybrid-attn] Analysis only: the softmax matrix that causal_attention computes implicitly.
++    q, k: (B, H, T, E) -> probs (B, H, T, T), float32. Same mask and 1/sqrt(E) scale as SDPA."""
++    T = q.size(-2)
++    scores = (q.float() @ k.float().transpose(-2, -1)) / math.sqrt(q.size(-1))
++    if window is None:
++        mask = torch.ones(T, T, dtype=torch.bool, device=q.device).tril()
++    else:
++        mask = sliding_window_mask(T, window, q.device)
++    return scores.masked_fill(~mask, float('-inf')).softmax(-1)
++
++class KVCache:
++    """Per-layer cache; every stored tensor has its time axis at dim -2.
++
++    full    (capacity = max_len): token t is stored at slot t.
++    rolling (capacity = W):       token t is stored at slot t % W, overwriting the oldest.
++
++    Keys are cached *after* RoPE, so each one already carries its absolute position, and
++    attention is invariant to the order of the keys. Hence at decode time we simply attend
++    to every filled slot: they are exactly the last min(t+1, W) tokens = the window.
++    """
++
++    def __init__(self, shapes, capacity, rolling, device, dtype):
++        self.capacity, self.rolling, self.length = capacity, rolling, 0
++        self.bufs = [torch.zeros(*s[:-1], capacity, s[-1], device=device, dtype=dtype) for s in shapes]
++
++    def update(self, *new):
++        """Append T new tokens (one tensor (..., T, d) per buffer); return the valid cached views."""
++        T, start = new[0].size(-2), self.length
++        if not self.rolling:
++            assert start + T <= self.capacity, "KV cache overflow: increase max_len"
++            for buf, t in zip(self.bufs, new):
++                buf[..., start:start + T, :] = t
++        elif T == 1:
++            slot = start % self.capacity
++            for buf, t in zip(self.bufs, new):
++                buf[..., slot:slot + 1, :] = t
++        else:  # rolling prefill: only the last `capacity` tokens survive
++            keep = min(T, self.capacity)
++            slots = torch.arange(start + T - keep, start + T, device=new[0].device) % self.capacity
++            for buf, t in zip(self.bufs, new):
++                buf[..., slots, :] = t[..., T - keep:, :]
++        self.length += T
++        n = min(self.length, self.capacity)
++        return [buf[..., :n, :] for buf in self.bufs]
++
++    def nbytes(self):
++        return sum(b.numel() * b.element_size() for b in self.bufs)
++
++# -----------------------------------------------------------------------------
++
+ class CausalSelfAttention(nn.Module):
++    """Upstream nanoGPT attention. [hybrid-attn] + optional RoPE, sliding window (attn='swa'), KV cache."""
+ 
+     def __init__(self, config):
+         super().__init__()
+@@ -36,20 +164,20 @@ class CausalSelfAttention(nn.Module):
+         # output projection
+         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
+         # regularization
+-        self.attn_dropout = nn.Dropout(config.dropout)
+         self.resid_dropout = nn.Dropout(config.dropout)
+         self.n_head = config.n_head
+         self.n_embd = config.n_embd
+         self.dropout = config.dropout
+-        # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
+-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+-        if not self.flash:
+-            print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
+-            # causal mask to ensure that attention is only applied to the left in the input sequence
+-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
+-                                        .view(1, 1, config.block_size, config.block_size))
++        # [hybrid-attn] (upstream's non-flash fallback for PyTorch < 2.0 removed: SDPA is required)
++        self.config = config
++        self.window = config.window if config.attn == 'swa' else None
++        self.cache = None
+ 
+-    def forward(self, x):
++    def cache_shapes(self, B):
++        hs = self.n_embd // self.n_head
++        return [(B, self.n_head, hs)] * 2  # K and V, each (B, nh, S, hs)
++
++    def forward(self, x, pos=None, use_cache=False):
+         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+ 
+         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+@@ -58,23 +186,143 @@ class CausalSelfAttention(nn.Module):
+         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+ 
+-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+-        if self.flash:
+-            # efficient attention using Flash Attention CUDA kernels
+-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
++        if self.config.pos_emb == 'rope': # [hybrid-attn]
++            cos, sin = rope_cos_sin(pos, C // self.n_head, self.config.rope_base, x.dtype)
++            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
++
++        if use_cache: # [hybrid-attn]
++            k_all, v_all = self.cache.update(k, v)
++        if use_cache and T == 1:
++            # decode: the cache holds exactly the keys this query may see -> no mask
++            y = F.scaled_dot_product_attention(q, k_all, v_all)
+         else:
+-            # manual implementation of attention
+-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+-            att = F.softmax(att, dim=-1)
+-            att = self.attn_dropout(att)
+-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
++            # causal (optionally windowed) self-attention; (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
++            y = causal_attention(q, k, v, self.window, self.dropout if self.training else 0, self.config.window_impl)
+         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+ 
+         # output projection
+         y = self.resid_dropout(self.c_proj(y))
+         return y
+ 
++    @torch.no_grad()
++    def probe(self, x, pos):
++        """[hybrid-attn] Analysis only (see probe.py): attention probabilities and the per-token
++        quantities that would be cached. Returns dict(probs (B,H,T,T), k, v, k_nope (B,H,T,hs));
++        k_nope is the key before RoPE (comparable to MLA's c_kv, which is also position-free)."""
++        B, T, C = x.size()
++        q, k, v = self.c_attn(x).split(self.n_embd, dim=2)
++        q, k, v = (t.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) for t in (q, k, v))
++        k_nope = k
++        if self.config.pos_emb == 'rope':
++            cos, sin = rope_cos_sin(pos, C // self.n_head, self.config.rope_base, x.dtype)
++            q, k = apply_rope(q, cos, sin), apply_rope(k, cos, sin)
++        return dict(probs=explicit_attention_probs(q, k, self.window), k=k, v=v, k_nope=k_nope)
++
++class MultiHeadLatentAttention(nn.Module):
++    """[hybrid-attn] DeepSeek-V2 MLA (Sec. 2.1, eqs. 9-19); attn='mla_swa' adds the sliding window.
++
++    Cached per token: the KV latent c_kv (dc) and the RoPE key k_R (dR) shared by all heads,
++    i.e. dc + dR numbers instead of 2 * n_head * hs for MHA.
++    """
++
++    def __init__(self, config):
++        super().__init__()
++        C, H = config.n_embd, config.n_head
++        hs, dc, dq, dR = C // H, config.kv_latent, config.q_latent, config.rope_dim
++        assert dR % 2 == 0
++        self.config, self.n_head, self.hs, self.dc, self.dR = config, H, hs, dc, dR
++        self.window = config.window if config.attn == 'mla_swa' else None
++        self.dropout = config.dropout
++        # query path: low-rank only to save activation memory in training (queries are not cached)
++        self.q_down = nn.Linear(C, dq, bias=False)           # W_DQ
++        self.q_norm = nn.RMSNorm(dq)
++        self.q_up = nn.Linear(dq, H * hs, bias=False)        # W_UQ
++        self.q_rope = nn.Linear(dq, H * dR, bias=False)      # W_QR: one RoPE query per head
++        # key/value path
++        self.kv_down = nn.Linear(C, dc, bias=False)          # W_DKV -> c_kv (cached)
++        self.kv_norm = nn.RMSNorm(dc)
++        self.k_up = nn.Linear(dc, H * hs, bias=False)        # W_UK
++        self.v_up = nn.Linear(dc, H * hs, bias=False)        # W_UV
++        self.k_rope = nn.Linear(C, dR, bias=False)           # W_KR: ONE RoPE key for all heads (cached)
++        self.c_proj = nn.Linear(H * hs, C, bias=config.bias) # W_O
++        self.resid_dropout = nn.Dropout(config.dropout)
++        self.cache = None
++
++    def cache_shapes(self, B):
++        # ONE buffer per token holding [c_kv | k_R]: (B, S, dc + dR). Keeping them contiguous lets
++        # the absorbed decode use it directly as the single shared key (and its first dc dims as value).
++        return [(B, self.dc + self.dR)]
++
++    def forward(self, x, pos, use_cache=False):
++        B, T, _ = x.size()
++        H, hs, dR = self.n_head, self.hs, self.dR
++        cos, sin = rope_cos_sin(pos, dR, self.config.rope_base, x.dtype)
++
++        c_q = self.q_norm(self.q_down(x))                                     # (B, T, dq)
++        q_c = self.q_up(c_q).view(B, T, H, hs).transpose(1, 2)                # (B, H, T, hs)
++        q_r = self.q_rope(c_q).view(B, T, H, dR).transpose(1, 2)              # (B, H, T, dR)
++        q_r = apply_rope(q_r, cos, sin)
++        c_kv = self.kv_norm(self.kv_down(x))                                  # (B, T, dc)
++        k_r = apply_rope(self.k_rope(x), cos, sin)                            # (B, T, dR)
++
++        if use_cache:
++            (lat_all,) = self.cache.update(torch.cat([c_kv, k_r], dim=-1))    # (B, S, dc + dR)
++        if use_cache and T == 1:
++            y = self._decode_absorbed(q_c, q_r, lat_all)
++        else:
++            y = self._attend_expanded(q_c, q_r, c_kv, k_r)
++        y = y.transpose(1, 2).contiguous().view(B, T, H * hs)
++        return self.resid_dropout(self.c_proj(y))
++
++    @torch.no_grad()
++    def probe(self, x, pos):
++        """[hybrid-attn] Analysis only (see probe.py): attention probabilities, the cached latent
++        c_kv (B,T,dc) and the re-expanded per-head k (content + RoPE part), v (B,H,T,hs)."""
++        B, T, _ = x.size()
++        H, hs, dR = self.n_head, self.hs, self.dR
++        cos, sin = rope_cos_sin(pos, dR, self.config.rope_base, x.dtype)
++        c_q = self.q_norm(self.q_down(x))
++        q_c = self.q_up(c_q).view(B, T, H, hs).transpose(1, 2)
++        q_r = apply_rope(self.q_rope(c_q).view(B, T, H, dR).transpose(1, 2), cos, sin)
++        c_kv = self.kv_norm(self.kv_down(x))
++        k_r = apply_rope(self.k_rope(x), cos, sin)
++        k_c = self.k_up(c_kv).view(B, T, H, hs).transpose(1, 2)
++        v = self.v_up(c_kv).view(B, T, H, hs).transpose(1, 2)
++        q = torch.cat([q_c, q_r], dim=-1)
++        k = torch.cat([k_c, k_r.unsqueeze(1).expand(B, H, T, dR)], dim=-1)
++        return dict(probs=explicit_attention_probs(q, k, self.window), k=k, v=v, c_kv=c_kv)
++
++    def _attend_expanded(self, q_c, q_r, c_kv, k_r):
++        """Training / prefill: re-expand per-head K, V from the latent, then ordinary attention."""
++        B, S, _ = c_kv.size()
++        H, hs, dR = self.n_head, self.hs, self.dR
++        k_c = self.k_up(c_kv).view(B, S, H, hs).transpose(1, 2)               # (B, H, S, hs)
++        v = self.v_up(c_kv).view(B, S, H, hs).transpose(1, 2)                 # (B, H, S, hs)
++        q = torch.cat([q_c, q_r], dim=-1)                                     # (B, H, T, hs+dR)
++        k = torch.cat([k_c, k_r.unsqueeze(1).expand(B, H, S, dR)], dim=-1)    # (B, H, S, hs+dR)
++        return causal_attention(q, k, v, self.window, self.dropout if self.training else 0, self.config.window_impl)
++
++    def _decode_absorbed(self, q_c, q_r, lat):
++        """Absorption trick (DeepSeek-V2 Sec. 2.1.2): never materialise per-head K/V of the cache.
++
++            q_c . k_j     = q_c . (W_UK^h c_j) = (W_UK^h^T q_c) . c_j
++            sum_j p_j v_j = W_UV^h (sum_j p_j c_j)
++
++        After absorption every head attends to the SAME key [c_j | k_R_j] (dc + dR dims) and the
++        SAME value c_j (dc dims): decode is multi-query attention with H query heads and one
++        shared KV head. We run it as a single SDPA call with the H heads in the "query length" slot.
++        q_c (B,H,1,hs)  q_r (B,H,1,dR)  lat (B,S,dc+dR) = [c_kv | k_R]
++        """
++        B, H, hs, dc = q_c.size(0), self.n_head, self.hs, self.dc
++        W_UK = self.k_up.weight.view(H, hs, dc)                               # (H, hs, dc)
++        W_UV = self.v_up.weight.view(H, hs, dc)                               # (H, hs, dc)
++        q_lat = torch.einsum('bhtd,hdc->bhtc', q_c, W_UK)                     # (B, H, 1, dc)
++        q = torch.cat([q_lat, q_r], dim=-1).view(B, 1, H, dc + self.dR)       # heads -> query slots
++        k = lat.unsqueeze(1)                                                  # (B, 1, S, dc+dR)
++        v = lat[..., :dc].unsqueeze(1)                                        # (B, 1, S, dc)
++        o_lat = F.scaled_dot_product_attention(q, k, v, scale=1.0 / math.sqrt(hs + self.dR))  # (B,1,H,dc)
++        return torch.einsum('bhc,hdc->bhd', o_lat.squeeze(1), W_UV).unsqueeze(2)  # (B, H, 1, hs)
++
+ class MLP(nn.Module):
+ 
+     def __init__(self, config):
+@@ -96,12 +344,13 @@ class Block(nn.Module):
+     def __init__(self, config):
+         super().__init__()
+         self.ln_1 = LayerNorm(config.n_embd, bias=config.bias)
+-        self.attn = CausalSelfAttention(config)
++        # [hybrid-attn] choose the attention variant
++        self.attn = MultiHeadLatentAttention(config) if config.attn in ('mla', 'mla_swa') else CausalSelfAttention(config)
+         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
+         self.mlp = MLP(config)
+ 
+-    def forward(self, x):
+-        x = x + self.attn(self.ln_1(x))
++    def forward(self, x, pos=None, use_cache=False):
++        x = x + self.attn(self.ln_1(x), pos, use_cache)
+         x = x + self.mlp(self.ln_2(x))
+         return x
+ 
+@@ -114,6 +363,30 @@ class GPTConfig:
+     n_embd: int = 768
+     dropout: float = 0.0
+     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
++    # [hybrid-attn] new fields; defaults reproduce upstream nanoGPT
++    attn: str = 'mha'         # 'mha' | 'swa' | 'mla' | 'mla_swa'
++    pos_emb: str = 'learned'  # 'learned' (upstream wpe table) | 'rope'
++    window: int = 64          # W for swa / mla_swa (keys visible per query, including itself)
++    window_impl: str = 'mask' # training / prefill: 'mask' (naive, O(T^2)) | 'block' (optimized, O(T*W))
++    kv_latent: int = 64       # dc  (MLA)
++    q_latent: int = 96        # dq  (MLA)
++    rope_dim: int = 16        # dR  (MLA decoupled RoPE, per head)
++    rope_base: float = 10000.0
++
++    def __post_init__(self):
++        assert self.attn in ('mha', 'swa', 'mla', 'mla_swa')
++        assert self.pos_emb in ('learned', 'rope')
++        assert self.window_impl in ('mask', 'block')
++        if self.attn in ('mla', 'mla_swa'):
++            assert self.pos_emb == 'rope', "MLA's position information is its decoupled RoPE"
++
++    @property
++    def windowed(self):
++        return self.attn in ('swa', 'mla_swa')
++
++    def cache_elems_per_token_per_layer(self):
++        """Cached scalars per token per layer: 2*n_head*hs (MHA) or dc + dR (MLA)."""
++        return self.kv_latent + self.rope_dim if self.attn in ('mla', 'mla_swa') else 2 * self.n_embd
+ 
+ class GPT(nn.Module):
+ 
+@@ -125,11 +398,12 @@ class GPT(nn.Module):
+ 
+         self.transformer = nn.ModuleDict(dict(
+             wte = nn.Embedding(config.vocab_size, config.n_embd),
+-            wpe = nn.Embedding(config.block_size, config.n_embd),
+             drop = nn.Dropout(config.dropout),
+             h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),
+             ln_f = LayerNorm(config.n_embd, bias=config.bias),
+         ))
++        if config.pos_emb == 'learned': # [hybrid-attn] no absolute table when using RoPE
++            self.transformer.wpe = nn.Embedding(config.block_size, config.n_embd)
+         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
+         # with weight tying when using torch.compile() some warnings get generated:
+         # "UserWarning: functional_call was passed multiple values for tied weights.
+@@ -155,10 +429,13 @@ class GPT(nn.Module):
+         params are actually used as weights in the final layer, so we include them.
+         """
+         n_params = sum(p.numel() for p in self.parameters())
+-        if non_embedding:
++        if non_embedding and 'wpe' in self.transformer:
+             n_params -= self.transformer.wpe.weight.numel()
+         return n_params
+ 
++    def get_num_attn_params(self): # [hybrid-attn]
++        return sum(p.numel() for b in self.transformer.h for p in b.attn.parameters())
++
+     def _init_weights(self, module):
+         if isinstance(module, nn.Linear):
+             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+@@ -167,24 +444,37 @@ class GPT(nn.Module):
+         elif isinstance(module, nn.Embedding):
+             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
+ 
+-    def forward(self, idx, targets=None):
++    def forward(self, idx, targets=None, start_pos=None, all_logits=False):
++        """[hybrid-attn] start_pos=None: plain forward (as upstream). start_pos=int: incremental
++        forward through the KV cache (call setup_cache first). all_logits: return logits for
++        every position even without targets."""
+         device = idx.device
+         b, t = idx.size()
+-        assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
+-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
++        use_cache = start_pos is not None
++        if use_cache:
++            assert start_pos == self.transformer.h[0].attn.cache.length, "KV cache out of sync"
++            assert start_pos == 0 or t == 1, "multi-token steps are only supported as the initial prefill"
++        p0 = start_pos or 0
++        if self.config.pos_emb == 'learned':
++            assert p0 + t <= self.config.block_size, f"Cannot forward sequence of length {p0 + t}, block size is only {self.config.block_size}"
++        pos = torch.arange(p0, p0 + t, dtype=torch.long, device=device) # shape (t)
+ 
+         # forward the GPT model itself
+         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+-        pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+-        x = self.transformer.drop(tok_emb + pos_emb)
++        if self.config.pos_emb == 'learned':
++            tok_emb = tok_emb + self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
++        x = self.transformer.drop(tok_emb)
+         for block in self.transformer.h:
+-            x = block(x)
++            x = block(x, pos, use_cache)
+         x = self.transformer.ln_f(x)
+ 
+         if targets is not None:
+             # if we are given some desired targets also calculate the loss
+             logits = self.lm_head(x)
+             loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
++        elif all_logits:
++            logits = self.lm_head(x)
++            loss = None
+         else:
+             # inference-time mini-optimization: only forward the lm_head on the very last position
+             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
+@@ -192,16 +482,30 @@ class GPT(nn.Module):
+ 
+         return logits, loss
+ 
++    # [hybrid-attn] KV cache management ------------------------------------------------
++    def setup_cache(self, batch_size, max_len, dtype=None):
++        """Allocate per-layer caches. Windowed variants get a rolling buffer of W slots."""
++        device = self.lm_head.weight.device
++        dtype = dtype or self.lm_head.weight.dtype
++        cap = min(self.config.window, max_len) if self.config.windowed else max_len
++        for block in self.transformer.h:
++            block.attn.cache = KVCache(block.attn.cache_shapes(batch_size), cap, self.config.windowed, device, dtype)
++
++    def clear_cache(self):
++        for block in self.transformer.h:
++            block.attn.cache = None
++
++    def cache_nbytes(self):
++        return sum(block.attn.cache.nbytes() for block in self.transformer.h)
++
+     def crop_block_size(self, block_size):
+         # model surgery to decrease the block size if necessary
+         # e.g. we may load the GPT2 pretrained model checkpoint (block size 1024)
+         # but want to use a smaller block size for some smaller, simpler model
+         assert block_size <= self.config.block_size
+         self.config.block_size = block_size
+-        self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+-        for block in self.transformer.h:
+-            if hasattr(block.attn, 'bias'):
+-                block.attn.bias = block.attn.bias[:,:,:block_size,:block_size]
++        if 'wpe' in self.transformer:
++            self.transformer.wpe.weight = nn.Parameter(self.transformer.wpe.weight[:block_size])
+ 
+     @classmethod
+     def from_pretrained(cls, model_type, override_args=None):
+@@ -303,17 +607,24 @@ class GPT(nn.Module):
+         return mfu
+ 
+     @torch.no_grad()
+-    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
++    def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None, use_cache=False):
+         """
+         Take a conditioning sequence of indices idx (LongTensor of shape (b,t)) and complete
+         the sequence max_new_tokens times, feeding the predictions back into the model each time.
+         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
++        [hybrid-attn] use_cache=True: prefill once, then decode one token at a time via the KV
++        cache (requires pos_emb='rope' or a total length <= block_size).
+         """
+-        for _ in range(max_new_tokens):
+-            # if the sequence context is growing too long we must crop it at block_size
+-            idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
+-            # forward the model to get the logits for the index in the sequence
+-            logits, _ = self(idx_cond)
++        if use_cache:
++            T = idx.size(1)
++            self.setup_cache(idx.size(0), T + max_new_tokens)
++            logits, _ = self(idx, start_pos=0)
++        for i in range(max_new_tokens):
++            if not use_cache:
++                # if the sequence context is growing too long we must crop it at block_size
++                idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
++                # forward the model to get the logits for the index in the sequence
++                logits, _ = self(idx_cond)
+             # pluck the logits at the final step and scale by desired temperature
+             logits = logits[:, -1, :] / temperature
+             # optionally crop the logits to only the top k options
+@@ -326,5 +637,9 @@ class GPT(nn.Module):
+             idx_next = torch.multinomial(probs, num_samples=1)
+             # append sampled index to the running sequence and continue
+             idx = torch.cat((idx, idx_next), dim=1)
++            if use_cache and i < max_new_tokens - 1:
++                logits, _ = self(idx_next, start_pos=T + i)
++        if use_cache:
++            self.clear_cache()
+ 
+         return idx
+diff --git a/upstream_ref/train.py b/train.py
+index de57850..da9e6de 100644
+--- a/upstream_ref/train.py
++++ b/train.py
+@@ -54,6 +54,16 @@ n_head = 12
+ n_embd = 768
+ dropout = 0.0 # for pretraining 0 is good, for finetuning try 0.1+
+ bias = False # do we use bias inside LayerNorm and Linear layers?
++# [hybrid-attn] attention variant (see model.py); defaults = upstream nanoGPT
++attn = 'mha' # 'mha' | 'swa' | 'mla' | 'mla_swa'
++pos_emb = 'learned' # 'learned' | 'rope'
++window = 64 # sliding window W
++window_impl = 'mask' # 'mask' (naive) | 'block' (optimized), same result
++kv_latent = 64 # MLA d_c
++q_latent = 96 # MLA d_c'
++rope_dim = 16 # MLA d_R
++seed = 1337
++metrics_file = '' # if set, write final metrics (fixed-batch val loss, per-position loss, timing) as JSON
+ # adamw optimizer
+ learning_rate = 6e-4 # max learning rate
+ max_iters = 600000 # total number of training iterations
+@@ -103,7 +113,7 @@ print(f"tokens per iteration will be: {tokens_per_iter:,}")
+ 
+ if master_process:
+     os.makedirs(out_dir, exist_ok=True)
+-torch.manual_seed(1337 + seed_offset)
++torch.manual_seed(seed + seed_offset) # [hybrid-attn] seed is configurable (upstream: 1337)
+ torch.backends.cuda.matmul.allow_tf32 = True # allow tf32 on matmul
+ torch.backends.cudnn.allow_tf32 = True # allow tf32 on cudnn
+ device_type = 'cuda' if 'cuda' in device else 'cpu' # for later use in torch.autocast
+@@ -145,7 +155,9 @@ if os.path.exists(meta_path):
+ 
+ # model init
+ model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
+-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
++                  bias=bias, vocab_size=None, dropout=dropout, # start with model_args from command line
++                  attn=attn, pos_emb=pos_emb, window=window, kv_latent=kv_latent, # [hybrid-attn]
++                  q_latent=q_latent, rope_dim=rope_dim, window_impl=window_impl)
+ if init_from == 'scratch':
+     # init a new model from scratch
+     print("Initializing a new model from scratch")
+@@ -163,7 +175,8 @@ elif init_from == 'resume':
+     checkpoint_model_args = checkpoint['model_args']
+     # force these config attributes to be equal otherwise we can't even resume training
+     # the rest of the attributes (e.g. dropout) can stay as desired from command line
+-    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size']:
++    for k in ['n_layer', 'n_head', 'n_embd', 'block_size', 'bias', 'vocab_size',
++              'attn', 'pos_emb', 'window', 'kv_latent', 'q_latent', 'rope_dim']: # [hybrid-attn]
+         model_args[k] = checkpoint_model_args[k]
+     # create the model
+     gptconf = GPTConfig(**model_args)
+@@ -252,6 +265,7 @@ t0 = time.time()
+ local_iter_num = 0 # number of iterations in the lifetime of this process
+ raw_model = model.module if ddp else model # unwrap DDP container if needed
+ running_mfu = -1.0
++val_curve, iter_times = [], [] # [hybrid-attn]
+ while True:
+ 
+     # determine and set the learning rate for this iteration
+@@ -263,6 +277,7 @@ while True:
+     if iter_num % eval_interval == 0 and master_process:
+         losses = estimate_loss()
+         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
++        val_curve.append((iter_num, losses['train'].item(), losses['val'].item())) # [hybrid-attn]
+         if wandb_log:
+             wandb.log({
+                 "iter": iter_num,
+@@ -317,6 +332,8 @@ while True:
+     t1 = time.time()
+     dt = t1 - t0
+     t0 = t1
++    if local_iter_num >= 10 and iter_num % eval_interval != 0: # [hybrid-attn] skip warm-up and eval iters
++        iter_times.append(dt)
+     if iter_num % log_interval == 0 and master_process:
+         # get loss as float. note: this is a CPU-GPU sync point
+         # scale up to undo the division above, approximating the true total loss (exact would have been a sum)
+@@ -332,5 +349,34 @@ while True:
+     if iter_num > max_iters:
+         break
+ 
++# [hybrid-attn] final metrics on a FIXED set of validation batches (identical for every run),
++# including the loss at every position in the context, to see where a sliding window hurts.
++if metrics_file and master_process:
++    import json
++    raw_model.eval()
++    val_data = np.memmap(os.path.join(data_dir, 'val.bin'), dtype=np.uint16, mode='r')
++    g = torch.Generator().manual_seed(1234)
++    n_eval, pos_loss = 200, torch.zeros(block_size, device=device)
++    with torch.no_grad():
++        for _ in range(n_eval):
++            ix = torch.randint(len(val_data) - block_size - 1, (batch_size,), generator=g)
++            X = torch.stack([torch.from_numpy(val_data[i:i+block_size].astype(np.int64)) for i in ix]).to(device)
++            Y = torch.stack([torch.from_numpy(val_data[i+1:i+1+block_size].astype(np.int64)) for i in ix]).to(device)
++            with ctx:
++                logits, _ = raw_model(X, all_logits=True)
++            pos_loss += torch.nn.functional.cross_entropy(logits.float().transpose(1, 2), Y, reduction='none').mean(0)
++    pos_loss /= n_eval
++    metrics = dict(config=config, model_args=model_args,
++                   final_val_loss=pos_loss.mean().item(), per_position_loss=pos_loss.tolist(),
++                   val_curve=val_curve, ms_per_iter=1000 * float(np.median(iter_times)),
++                   peak_mem_mb=torch.cuda.max_memory_allocated() / 2**20 if device_type == 'cuda' else None,
++                   params=raw_model.get_num_params(), attn_params=raw_model.get_num_attn_params(),
++                   cache_elems_per_token_per_layer=raw_model.config.cache_elems_per_token_per_layer())
++    os.makedirs(os.path.dirname(metrics_file) or '.', exist_ok=True)
++    with open(metrics_file, 'w') as f:
++        json.dump(metrics, f, indent=1)
++    print(f"final val loss (fixed batches) {metrics['final_val_loss']:.4f}, "
++          f"{metrics['ms_per_iter']:.1f} ms/iter -> {metrics_file}")
++
+ if ddp:
+     destroy_process_group()

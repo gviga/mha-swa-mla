@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.pytest_cache/
+out/
+data/shakespeare_char/*.bin
+data/shakespeare_char/*.pkl
+data/shakespeare_char/input.txt
+logs_*.txt
