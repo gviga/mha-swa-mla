@@ -95,8 +95,8 @@ def shakespeare(lines):
     lines.append("")
 
 
-def recall(lines, src="results/recall", small_src="results/recall_w16", fname="recall_accuracy",
-           title="Long-range recall (1 fact): accuracy vs distance"):
+def recall(lines, src="results/recall", small_src="results/recall_w16"):
+    fname, title = "recall_accuracy", "Long-range recall (1 fact): accuracy vs distance"
     runs = defaultdict(list)
     for f in glob.glob(f"{src}/*.json"):
         runs[os.path.basename(f).rsplit("_s", 1)[0]].append(json.load(open(f)))
@@ -113,7 +113,7 @@ def recall(lines, src="results/recall", small_src="results/recall_w16", fname="r
         ax.fill_between(ds, np.clip(m - s, 0, 1), np.clip(m + s, 0, 1), color=COLORS[k], alpha=0.15, linewidth=0)
         lines.append(f"| {LABELS[k]} ({len(runs[k])} seeds) | " + " | ".join(f"{v:.2f}" for v in m) + " |")
     small = defaultdict(list)  # extra runs with W=16: receptive field 4*(16-1) = 60 tokens
-    for f in glob.glob(f"{small_src}/*.json") if small_src else []:
+    for f in glob.glob(f"{small_src}/*.json"):
         small[os.path.basename(f).rsplit("_s", 1)[0]].append(json.load(open(f)))
     for k in [k for k in ORDER if k in small]:
         m, _ = mean_std([[r["acc_by_distance"][str(d)] for d in ds] for r in small[k]])
@@ -160,21 +160,21 @@ def bench(lines):
     lines.append("")
 
     # decode latency
-    for B in (16,):
-        dl = b[f"decode_ms_per_token_B{B}"]
-        fig, ax = plt.subplots(figsize=(6, 3.6))
-        for name, rows in dl.items():
-            c, t = zip(*rows)
-            ax.plot(c, t, **style(name))
-        ax.set(xscale="log", xlabel="tokens already in context", ylabel="ms per generated token",
-               title=f"Decode latency vs context (batch {B})")
-        ax.legend(fontsize=7)
-        save(fig, f"decode_latency_B{B}")
-        ctxs = [r[0] for r in next(iter(dl.values()))]
-        lines += [f"Decode latency, ms per token (batch {B}):", "",
-                  "| variant | " + " | ".join(f"ctx={c}" for c in ctxs) + " |", "|---" * (len(ctxs) + 1) + "|"]
-        lines += [f"| {n} | " + " | ".join(f"{t:.2f}" for _, t in rows) + " |" for n, rows in dl.items()]
-        lines.append("")
+    B = 16
+    dl = b[f"decode_ms_per_token_B{B}"]
+    fig, ax = plt.subplots(figsize=(6, 3.6))
+    for name, rows in dl.items():
+        c, t = zip(*rows)
+        ax.plot(c, t, **style(name))
+    ax.set(xscale="log", xlabel="tokens already in context", ylabel="ms per generated token",
+           title=f"Decode latency vs context (batch {B})")
+    ax.legend(fontsize=7)
+    save(fig, f"decode_latency_B{B}")
+    ctxs = [r[0] for r in next(iter(dl.values()))]
+    lines += [f"Decode latency, ms per token (batch {B}):", "",
+              "| variant | " + " | ".join(f"ctx={c}" for c in ctxs) + " |", "|---" * (len(ctxs) + 1) + "|"]
+    lines += [f"| {n} | " + " | ".join(f"{t:.2f}" for _, t in rows) + " |" for n, rows in dl.items()]
+    lines.append("")
 
     # training cost: naive (mask) vs optimized (block) window; peak memory is in the table
     tr = b["train_step_B8"]

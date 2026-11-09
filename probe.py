@@ -3,7 +3,6 @@
 For every checkpoint, on a fixed batch of 32 x 256 validation characters, it measures:
   * attention maps per head, and attention vs relative distance i - j  -> visual check that the window
     is exactly W wide in the trained models, and how much attention full models put beyond W;
-  * attention entropy H_i = -sum_j p_ij log p_ij  and  exp(H) = "effective number of keys";
   * attention sinks: mass on the first token (StreamingLLM, Xiao et al. 2023; threshold 0.3 as in
     Gu et al. 2024) and mass on newline keys, plus the value norm of those keys (sinks are no-op keys);
   * residual-stream geometry per layer: spectral entropy of the token covariance, effective rank,
@@ -81,7 +80,6 @@ def attention_stats(P, v, idx, window):
     n_vis = (i + 1) if window is None else (i + 1).clamp(max=window)
     late, early = i >= W_REF, (i >= 1) & (i < W_REF)
     rel = i[:, None] - i[None, :]                                           # i - j
-    ent = -(P * P.clamp_min(1e-30).log()).sum(-1)                           # (B, H, T)
     q0 = T // 2                                                             # profile over queries i >= T/2
     profile = torch.stack([torch.diagonal(P, -d, -2, -1)[..., q0 - d:].mean((0, 2)) for d in range(q0 + 1)], -1)
     # newline keys: share of attention they get vs the share a uniform head would give them
@@ -94,10 +92,6 @@ def attention_stats(P, v, idx, window):
     vn = v.norm(dim=-1)                                                     # (B, H, T)
     isnl = idx == NEWLINE
     return dict(
-        entropy_late=ent[..., late].mean((0, 2)),
-        eff_keys_late=ent[..., late].exp().mean((0, 2)),
-        entropy_by_pos=ent.mean(0),                                         # (H, T)
-        dist_late=(P * rel).sum(-1)[..., late].mean((0, 2)),
         far_mass_late=(P * (rel >= W_REF)).sum(-1)[..., late].mean((0, 2)),  # attention beyond W tokens
         dist_profile=profile,                                               # (H, T/2 + 1)
         sink0_early=P[:, :, early, 0].mean((0, 2)),
@@ -114,7 +108,7 @@ def spectrum_stats(X):
     Hs = -(p * p.clamp_min(1e-300).log()).sum()
     cum = p.cumsum(0)
     return {"spec_entropy": (Hs / math.log(X.size(1))).item(), "eff_rank": Hs.exp().item(), "dim": X.size(1),
-            "var_top16": cum[15].item(), "var_top64": cum[63].item(), "spectrum": p[:64].tolist()}
+            "var_top64": cum[63].item(), "spectrum": p[:64].tolist()}
 
 
 def hidden_stats(h):

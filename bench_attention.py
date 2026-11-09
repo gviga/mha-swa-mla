@@ -139,7 +139,6 @@ def main():
     res["cache_memory_bytes_B1"] = cache_memory([256, 1024, 4096, 16384, 65536])
     print("cache memory ok (matches formula)")
     res["decode_ms_per_token_B16"] = decode_latency([256, 1024, 4096, 16384], B=16)
-    res["decode_ms_per_token_B1"] = decode_latency([256, 4096, 16384], B=1)
     res["train_step_B8"] = train_step_cost(TRAIN_LENGTHS, B=8)
     res["paper_scale_cache_MiB_per_sequence"] = paper_scale()
     json.dump(res, open("results/bench/bench.json", "w"), indent=1)
