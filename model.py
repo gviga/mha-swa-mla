@@ -90,7 +90,7 @@ def block_window_attention(q, k, v, W, dropout_p=0.0):
 def causal_attention(q, k, v, window=None, dropout_p=0.0, impl='mask'):
     """q, k: (B, H, T, E), v: (B, H, T, Ev); scale 1/sqrt(E) (= 1/sqrt(hs + dR) for MLA).
 
-    The window has two equivalent implementations (see REPORT.md, Section 2):
+    The window has two equivalent implementations (see README.md, Section 2):
     impl='mask':  naive; computes all T x T scores and loses the fused is_causal kernel.
     impl='block': optimized; computes O(T * W) scores.
     """
